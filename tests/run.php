@@ -96,15 +96,23 @@ check('order numbers, currencies and one session per order and total', function 
     same(SpotEx_Pay_Orders::order_ref('###'), 'order');
     same(SpotEx_Pay_Orders::supports_currency('EUR'), true);
     same(SpotEx_Pay_Orders::supports_currency('ARS'), false);
-    $a = SpotEx_Pay_Orders::idempotency_key(42, '25.00', 'EUR');
-    same(preg_match('/\A[A-Za-z0-9_-]{8,100}\z/', $a), 1, 'a key SpotEx takes');
-    same(SpotEx_Pay_Orders::idempotency_key(42, '25.00', 'EUR'), $a, 'the same order asked again: the same session');
-    same(SpotEx_Pay_Orders::idempotency_key(42, '30.00', 'EUR') === $a, false, 'a changed cart: a new one');
+    $a = SpotEx_Pay_Orders::idempotency_key('https://shop.example', 42, '25.00', 'EUR');
+    same(preg_match('/\A[A-Za-z0-9_-]{8,100}\z/', $a . '-12'), 1, 'a key SpotEx takes, with the try after it');
+    same(SpotEx_Pay_Orders::idempotency_key('https://shop.example', 42, '25.00', 'EUR'), $a, 'the same order asked again: the same session');
+    same(SpotEx_Pay_Orders::idempotency_key('https://shop.example', 42, '30.00', 'EUR') === $a, false, 'a changed cart: a new one');
+    same(SpotEx_Pay_Orders::idempotency_key('https://other.example', 42, '25.00', 'EUR') === $a, false, 'another shop on the same account: never the same');
     same(SpotEx_Pay_Orders::same_amount('25', '25.00'), true);
     same(SpotEx_Pay_Orders::same_amount('25.01', '25.1'), false);
 });
 
-$order = ['session_id' => 'cs1', 'earlier' => ['cs0'], 'price' => '25.00', 'total' => '25.00', 'currency' => 'EUR', 'test' => false];
+$order = [
+    'session_id' => 'cs1', 'price' => '25.00', 'total' => '25.00', 'currency' => 'EUR', 'test' => false,
+    'earlier' => [
+        ['id' => 'cs0', 'price' => '25.00', 'currency' => 'EUR', 'test' => false],
+        ['id' => 'cs-old', 'price' => '30.00', 'currency' => 'EUR', 'test' => false],
+        ['id' => 'cs-test', 'price' => '25.00', 'currency' => 'EUR', 'test' => true],
+    ],
+];
 $paid = function (array $checkout = [], bool $live = true): array {
     return ['type' => 'checkout.paid', 'livemode' => $live, 'data' => ['checkout' => $checkout + [
         'id' => 'cm1', 'session_id' => 'cs1', 'status' => 'paid', 'price' => '25.00', 'currency' => 'EUR', 'received' => '12.5', 'coin' => 'PPC', 'duplicate' => false,
@@ -130,7 +138,28 @@ check('nothing else completes an order', function () use ($order, $paid) {
     same(SpotEx_Pay_Orders::event_action($paid(['price' => '']), ['price' => ''] + $order)[0], 'ignore', 'empty prices never match');
     same(SpotEx_Pay_Orders::event_action($paid(['session_id' => '']), ['session_id' => ''] + $order)[0], 'ignore', 'nor empty sessions');
     same(SpotEx_Pay_Orders::event_action($paid(), ['total' => '30.00'] + $order)[0], 'note', 'the total changed since it was sent');
-    same(SpotEx_Pay_Orders::event_action($paid(['session_id' => 'cs0']), $order)[0], 'note', 'paid on an earlier checkout of the order');
+    same(SpotEx_Pay_Orders::event_action($paid(['accepted_by' => 'auto']), $order)[0], 'ignore', 'released by SpotEx, whatever the event says');
+    same(SpotEx_Pay_Orders::event_action($paid(['session_id' => 'cs-old']), $order)[0], 'note', 'paid on an earlier checkout, for a total since changed');
+    same(SpotEx_Pay_Orders::event_action($paid(['session_id' => 'cs-test'], true), $order)[0], 'ignore', 'live money on an earlier test checkout');
+    same(SpotEx_Pay_Orders::event_action(['type' => 'checkout.released', 'livemode' => true, 'data' => ['checkout' => ['session_id' => 'cs1', 'status' => 'released']]], $order)[0], 'note');
+    same(SpotEx_Pay_Orders::event_action(['type' => 'checkout.extra', 'livemode' => true, 'data' => ['checkout' => ['session_id' => 'cs1']]], $order)[0], 'note');
+    $held = SpotEx_Pay_Orders::event_action(['type' => 'checkout.partial', 'livemode' => true, 'data' => ['checkout' => ['session_id' => 'cs1', 'duplicate' => true]]], $order);
+    same(strpos($held[1], 'second payment') !== false, true, 'a held second payment is called that, not part of this one');
+});
+
+check('paid on an earlier checkout of the same total (a buyer back for a second go): it pays the order', function () use ($order, $paid) {
+    same(SpotEx_Pay_Orders::event_action($paid(['session_id' => 'cs0']), $order)[0], 'complete');
+    same(SpotEx_Pay_Orders::event_action($paid(['session_id' => 'cs0'], false), $order)[0], 'ignore', 'but not with test money');
+});
+
+check('a session SpotEx answers with is used only if it is this order\'s, for this total, and open', function () {
+    $s = ['id' => 'cs9', 'status' => 'open', 'order_id' => '42', 'price' => '25.00', 'currency' => 'EUR'];
+    same(SpotEx_Pay_Orders::session_is_ours($s, '42', '25.00', 'EUR'), true);
+    same(SpotEx_Pay_Orders::session_is_ours($s, '42', '25', 'EUR'), true, '25 is 25.00');
+    same(SpotEx_Pay_Orders::session_is_ours(['order_id' => '41'] + $s, '42', '25.00', 'EUR'), false, 'another order\'s');
+    same(SpotEx_Pay_Orders::session_is_ours(['status' => 'paid'] + $s, '42', '25.00', 'EUR'), false, 'paid already');
+    same(SpotEx_Pay_Orders::session_is_ours(['price' => '20.00'] + $s, '42', '25.00', 'EUR'), false);
+    same(SpotEx_Pay_Orders::session_is_ours(['currency' => 'USD'] + $s, '42', '25.00', 'EUR'), false);
 });
 
 check('a test key: test payments only ever put an order on hold, never pay it', function () use ($order, $paid) {

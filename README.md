@@ -8,6 +8,7 @@ Take crypto at your WooCommerce checkout with [SpotEx Pay](https://spotex.trade/
 - Prices stay in your shop's currency: any of [these 37](https://spotex.trade/docs/merchant#currencies).
 - Orders are marked paid by SpotEx's signed webhook, never by the buyer coming back; if the webhook is late, the plugin asks SpotEx itself.
 - A test key (`sk_test_…`) only ever puts an order on hold: test payments can't give goods away.
+- A part payment SpotEx passes on without you accepting it (`checkout.released`) gets a note on the order, never marks it paid.
 
 ## Install
 
@@ -16,6 +17,8 @@ Take crypto at your WooCommerce checkout with [SpotEx Pay](https://spotex.trade/
 3. In WooCommerce → Settings → Payments → SpotEx Pay, paste the key and the secret, and enable it.
 
 Your SpotEx merchant website must be this shop's address: buyers are sent back to it after paying.
+
+Use one shop per SpotEx merchant account. SpotEx sends an account's webhooks to one address, so a second shop on the same account would hear of its payments only when buyers come back.
 
 ## How it works
 

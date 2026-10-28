@@ -123,32 +123,56 @@ class SpotEx_Pay_Gateway extends WC_Payment_Gateway
                 throw new InvalidArgumentException(sprintf('SpotEx Pay does not take %s.', $currency));
             }
             $price = SpotEx_Pay_Orders::price((string) $order->get_total(), $currency);
-            // Sent before for this total and still open: back to the same page.
             $kept = self::kept($order);
-            if ($kept['session_id'] !== '' && $kept['price'] === $price && $order->get_meta('_spotex_session_url') !== '') {
-                $open = $this->client(10)->retrieve_session($kept['session_id']);
-                if (($open['status'] ?? '') === 'open') {
+            // Made with the other kind of key (test or live), it can't be asked about: a new one follows.
+            if ($kept['session_id'] !== '' && $kept['test'] === $this->client()->is_test_mode()) {
+                try {
+                    $last = $this->client(10)->retrieve_session($kept['session_id']);
+                } catch (SpotEx_Pay_Error $e) {
+                    if ($e->status !== 404) {
+                        throw $e;
+                    }
+                    $last = [];
+                }
+                // Sent before for this total and still open: back to the same page.
+                if (($last['status'] ?? '') === 'open' && $kept['price'] === $price && $order->get_meta('_spotex_session_url') !== '') {
                     return ['result' => 'success', 'redirect' => (string) $order->get_meta('_spotex_session_url')];
+                }
+                // Paid already, and the webhook not here yet: book it, rather than ask for the money again.
+                if (($last['status'] ?? '') === 'paid' && !empty($last['checkout_id'])) {
+                    $checkout = $this->client(10)->retrieve_checkout((string) $last['checkout_id']);
+                    $event = ['type' => 'checkout.paid', 'livemode' => ($checkout['livemode'] ?? false) === true, 'data' => ['checkout' => $checkout]];
+                    self::apply($order, SpotEx_Pay_Orders::event_action($event, $kept), (string) ($checkout['id'] ?? ''));
+                    $order = wc_get_order($order_id) ?: $order;
+                    if (!$order->needs_payment()) {
+                        return ['result' => 'success', 'redirect' => $this->get_return_url($order)];
+                    }
                 }
             }
             // Otherwise a new session: a new try's key, so an expired one is never handed back.
-            $attempt = (int) $order->get_meta('_spotex_attempt') + 1;
-            $session = $this->client()->create_session(
-                [
-                    'price' => $price,
-                    'currency' => $currency,
-                    // The order's number only: a shop name can hold a web address, which SpotEx refuses here.
-                    'item' => sprintf(__('Order %s', 'spotex-pay-for-woocommerce'), SpotEx_Pay_Orders::order_ref((string) $order->get_order_number())),
-                    // The order's id, which the webhook finds it by; the number above is what people read.
-                    'order_id' => (string) $order->get_id(),
-                    'return_url' => $this->get_return_url($order),
-                ],
-                SpotEx_Pay_Orders::idempotency_key((int) $order->get_id(), $price, $currency) . '-' . $attempt
-            );
+            $attempt = (int) $order->get_meta('_spotex_attempt');
+            $session = null;
+            for ($tries = 0; $tries < 2 && $session === null; $tries++) {
+                $attempt++;
+                $answer = $this->client()->create_session(
+                    [
+                        'price' => $price,
+                        'currency' => $currency,
+                        // The order's number only: a shop name can hold a web address, which SpotEx refuses here.
+                        'item' => sprintf(__('Order %s', 'spotex-pay-for-woocommerce'), SpotEx_Pay_Orders::order_ref((string) $order->get_order_number())),
+                        // The order's id, which the webhook finds it by; the number above is what people read.
+                        'order_id' => (string) $order->get_id(),
+                        'return_url' => $this->get_return_url($order),
+                    ],
+                    SpotEx_Pay_Orders::idempotency_key(home_url(), (int) $order->get_id(), $price, $currency) . '-' . $attempt
+                );
+                // A key used before (a restored backup, a copy of the shop) hands back that session: never take another order's.
+                $session = SpotEx_Pay_Orders::session_is_ours($answer, (string) $order->get_id(), $price, $currency) ? $answer : null;
+            }
             $url = (string) ($session['url'] ?? '');
             $host = (string) parse_url(SpotEx_Pay_Client::BASE_URL, PHP_URL_HOST);
-            if (empty($session['id']) || strpos($url, 'https://' . $host . '/') !== 0) {
-                throw new SpotEx_Pay_Error(0, 'invalid_response', 'SpotEx Pay answered without a payment page.');
+            if ($session === null || empty($session['id']) || strpos($url, 'https://' . $host . '/') !== 0) {
+                throw new SpotEx_Pay_Error(0, 'invalid_response', 'SpotEx Pay answered without a payment page for this order.');
             }
         } catch (SpotEx_Pay_Error $e) {
             $this->log("Order {$order_id}: could not make a checkout session: {$e->error_code} {$e->getMessage()}");
@@ -158,21 +182,34 @@ class SpotEx_Pay_Gateway extends WC_Payment_Gateway
             wc_add_notice(sprintf(__('Crypto payment could not be started: %s', 'spotex-pay-for-woocommerce'), $e->getMessage()), 'error');
             return ['result' => 'failure'];
         }
-        // The sessions it was sent to before: a payment on one of them still gets a note on the order.
-        $earlier = array_filter(array_merge((array) $order->get_meta('_spotex_earlier_sessions'), [(string) $order->get_meta('_spotex_session_id')]));
-        $order->update_meta_data('_spotex_earlier_sessions', array_values(array_unique(array_slice($earlier, -10))));
+        // The sessions it was sent to before, each as it was sent: a payment on one of them still counts, or gets a note.
+        $earlier = self::earlier($order);
+        if ($kept['session_id'] !== '') {
+            $earlier[] = ['id' => $kept['session_id'], 'price' => $kept['price'], 'currency' => $kept['currency'], 'test' => $kept['test']];
+        }
+        $test = $this->client()->is_test_mode();
+        $order->update_meta_data('_spotex_earlier_sessions', array_slice($earlier, -10));
         $order->update_meta_data('_spotex_session_id', (string) $session['id']);
         $order->update_meta_data('_spotex_session_url', $url);
         $order->update_meta_data('_spotex_attempt', $attempt);
         $order->update_meta_data('_spotex_price', $price);
-        $order->update_meta_data('_spotex_test', $this->client()->is_test_mode() ? 'yes' : 'no');
+        $order->update_meta_data('_spotex_currency', $currency);
+        $order->update_meta_data('_spotex_test', $test ? 'yes' : 'no');
         $order->save();
         $order->add_order_note(sprintf(__('Sent to SpotEx Pay to pay %1$s %2$s (session %3$s).', 'spotex-pay-for-woocommerce'), $price, $currency, $session['id']));
         $this->log("Order {$order_id}: session {$session['id']}");
         return ['result' => 'success', 'redirect' => $url];
     }
 
-    /** What an order keeps of its SpotEx session, for SpotEx_Pay_Orders::event_action. */
+    /** The sessions an order was sent to before its last: id, price, currency, test. */
+    private static function earlier(WC_Order $order): array
+    {
+        return array_values(array_filter((array) $order->get_meta('_spotex_earlier_sessions'), function ($before) {
+            return is_array($before) && is_string($before['id'] ?? null) && $before['id'] !== '';
+        }));
+    }
+
+    /** What an order keeps of its SpotEx sessions, for SpotEx_Pay_Orders::event_action. */
     private static function kept(WC_Order $order): array
     {
         try {
@@ -180,29 +217,43 @@ class SpotEx_Pay_Gateway extends WC_Payment_Gateway
         } catch (InvalidArgumentException $e) {
             $total = '';
         }
+        $currency = (string) $order->get_meta('_spotex_currency');
         return [
             'session_id' => (string) $order->get_meta('_spotex_session_id'),
-            'earlier' => array_map('strval', (array) $order->get_meta('_spotex_earlier_sessions')),
+            'earlier' => self::earlier($order),
             'price' => (string) $order->get_meta('_spotex_price'),
             'total' => $total,
-            'currency' => $order->get_currency(),
+            'currency' => $currency !== '' ? $currency : $order->get_currency(),
             'test' => $order->get_meta('_spotex_test') === 'yes',
         ];
     }
 
-    /** Does what a webhook, or the check on return, decided for an order. Paid once: an order already paid is left alone. */
+    /**
+     * Does what a webhook, or a check with SpotEx, decided for an order. A
+     * checkout is booked once: never again, even on an order reopened since
+     * (refunded and set back to pending, say).
+     */
     private static function apply(WC_Order $order, array $decision, string $transaction_id): void
     {
         [$action, $note] = $decision;
         if ($action === 'complete') {
             // Read again just before: a webhook and the thank-you check can arrive together.
             $order = wc_get_order($order->get_id()) ?: $order;
+            $booked = array_map('strval', (array) $order->get_meta('_spotex_paid_checkouts'));
+            if ($transaction_id === '' || in_array($transaction_id, $booked, true)) {
+                return;
+            }
             if ($order->needs_payment()) {
                 $order->payment_complete($transaction_id);
+                $order->update_meta_data('_spotex_paid_checkouts', array_slice(array_merge($booked, [$transaction_id]), -20));
+                $order->save();
                 $order->add_order_note($note);
-            } elseif (!$order->is_paid() && $order->get_transaction_id() !== $transaction_id) {
-                // Paid in full, but the order no longer takes payment — cancelled when stock was held too long, say.
-                $order->add_order_note($note . ' ' . sprintf(__('The order is %s, so it was not marked paid: restore it, or refund the payment from the SpotEx Merchant Center.', 'spotex-pay-for-woocommerce'), wc_get_order_status_name($order->get_status())));
+            } elseif ($order->get_transaction_id() !== $transaction_id) {
+                $order->add_order_note($order->is_paid()
+                    // Paid twice: two checkouts of the order, each in full.
+                    ? $note . ' ' . __('The order was paid already, so this is a second payment: refund it from the SpotEx Merchant Center if it isn\'t wanted.', 'spotex-pay-for-woocommerce')
+                    // Paid in full, but the order no longer takes payment — cancelled when stock was held too long, say.
+                    : $note . ' ' . sprintf(__('The order is %s, so it was not marked paid: restore it, or refund the payment from the SpotEx Merchant Center.', 'spotex-pay-for-woocommerce'), wc_get_order_status_name($order->get_status())));
             }
         } elseif ($action === 'test') {
             if ($order->needs_payment() && !$order->has_status('on-hold')) {
