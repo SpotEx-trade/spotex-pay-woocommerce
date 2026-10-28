@@ -31,7 +31,7 @@ final class SpotEx_Pay_Signature
             }
         }
         $t = $parts['t'] ?? '';
-        if (preg_match('/\A\d+\z/', $t) !== 1 || ($parts['v1'] ?? '') === '') {
+        if (preg_match('/\A\d{1,12}\z/', $t) !== 1 || ($parts['v1'] ?? '') === '') {
             throw new UnexpectedValueException('The SpotEx-Signature header is not in the form t=...,v1=....');
         }
         if ($tolerance > 0 && abs(time() - (int) $t) > $tolerance) {

@@ -88,13 +88,15 @@ final class SpotEx_Pay_Orders
 
     /**
      * What a webhook means for the order it names, given what the order keeps:
-     * ['complete', note] to mark it paid, ['test', note] for a test payment
-     * (never paid: anyone with a test page's link can press its buttons),
-     * ['note', note] to add a note, or ['ignore', ''].
+     * ['complete', note] to mark it paid, ['decline', note] for a payment
+     * that never pays it (noted, and remembered so it never does later),
+     * ['test', note] for a test payment (never paid: anyone with a test
+     * page's link can press its buttons), ['note', note] to add a note, or
+     * ['ignore', ''].
      *
      * @param array $order session_id, price, currency and test of the session it was sent to last; earlier (the
-     *                     sessions it was sent to before, each id, price, currency, test); and total (its total now,
-     *                     as a price)
+     *                     sessions it was sent to before, each id, price, currency, test); total and order_currency
+     *                     (what the order asks now)
      */
     public static function event_action(array $event, array $order): array
     {
@@ -122,7 +124,7 @@ final class SpotEx_Pay_Orders
         $type = (string) ($event['type'] ?? '');
         if ($type === 'checkout.paid') {
             if (!empty($checkout['duplicate'])) {
-                return ['note', "A second payment ({$what}) arrived for this order. It is in your SpotEx merchant wallet: refund it from the Merchant Center if it isn't wanted."];
+                return ['decline', "A second payment ({$what}) arrived for this order. It is in your SpotEx merchant wallet: refund it from the Merchant Center if it isn't wanted."];
             }
             // Released by SpotEx rather than accepted: comes as checkout.released, but never trust the type alone.
             if (($checkout['status'] ?? '') !== 'paid' || in_array($checkout['accepted_by'] ?? null, ['operator', 'auto'], true)) {
@@ -130,11 +132,11 @@ final class SpotEx_Pay_Orders
             }
             $price = (string) ($checkout['price'] ?? '');
             if (($checkout['currency'] ?? '') !== $sent['currency'] || preg_match('/\A\d+(\.\d+)?\z/', $price) !== 1 || !self::same_amount($price, $sent['price'])) {
-                return ['note', 'SpotEx reported a payment of ' . ($price ?: '?') . ' ' . ($checkout['currency'] ?? '') . ", not the total it was sent for: check it before shipping."];
+                return ['decline', 'SpotEx reported a payment of ' . ($price ?: '?') . ' ' . ($checkout['currency'] ?? '') . ", not the total it was sent for: check it before shipping."];
             }
-            // Sent to pay one total; the order now asks another (changed by hand, or by another plugin).
-            if (!self::same_amount($sent['price'], (string) ($order['total'] ?? $order['price'])) || $sent['currency'] !== $order['currency']) {
-                return ['note', "Paid {$sent['price']} {$sent['currency']} with SpotEx Pay, but the order's total is different now: check it before shipping."];
+            // Sent to pay one total; the order now asks another (changed by hand, by another plugin, or a currency switcher).
+            if (!self::same_amount($sent['price'], (string) ($order['total'] ?? $order['price'])) || $sent['currency'] !== ($order['order_currency'] ?? $order['currency'])) {
+                return ['decline', "Paid {$sent['price']} {$sent['currency']} with SpotEx Pay, but the order asks " . ($order['total'] ?? '?') . ' ' . ($order['order_currency'] ?? '') . " now: check it before shipping."];
             }
             $id = (string) ($checkout['id'] ?? '');
             if (!$live) {
@@ -148,8 +150,14 @@ final class SpotEx_Pay_Orders
             }
             return ['note', "Part of the payment arrived ({$what}). SpotEx holds it until the rest does, or until you accept it in the Merchant Center."];
         }
-        if ($type === 'checkout.released') {
-            return ['note', "A part payment ({$what}) waited too long and SpotEx passed it to your merchant wallet. The order is NOT paid: ask the buyer for the rest, or refund it from the Merchant Center."];
+        if ($type === 'checkout.released' || ($checkout['status'] ?? '') === 'released') {
+            if (!empty($checkout['duplicate'])) {
+                return ['note', "A second payment for this order ({$what}), held by SpotEx, was passed to your merchant wallet. The order was paid already: refund it from the Merchant Center if it isn't wanted."];
+            }
+            if (!empty($checkout['paid_late'])) {
+                return ['note', "A late payment ({$what}), worth less than the order when it arrived, was passed to your merchant wallet without you accepting it. The order is NOT paid: mark it paid by hand if you accept it, or refund it."];
+            }
+            return ['note', "A part payment ({$what}) waited too long, and SpotEx passed it to your merchant wallet. The order is NOT paid: ask the buyer for the rest, or refund it from the Merchant Center. If the rest comes to the same address, the order is paid then."];
         }
         if ($type === 'checkout.extra') {
             return ['note', "More arrived after this order was paid ({$what}). It is in your SpotEx merchant wallet: refund the extra from the Merchant Center if it isn't wanted."];
