@@ -79,12 +79,21 @@ final class SpotEx_Pay_Orders
      * (never paid: anyone with a test page's link can press its buttons),
      * ['note', note] to add a note, or ['ignore', ''].
      *
-     * @param array $order session_id, price, currency, and test (made with a test key)
+     * @param array $order session_id, earlier (sessions it was sent to before), price (as sent), total (its
+     *                     total now, as a price), currency, and test (made with a test key)
      */
     public static function event_action(array $event, array $order): array
     {
         $checkout = $event['data']['checkout'] ?? null;
-        if (!is_array($checkout) || ($checkout['session_id'] ?? null) === null || $checkout['session_id'] !== $order['session_id']) {
+        $session = is_array($checkout) ? ($checkout['session_id'] ?? null) : null;
+        if (!is_string($session) || $session === '' || $order['session_id'] === '' || $order['price'] === '') {
+            return ['ignore', ''];
+        }
+        if ($session !== $order['session_id']) {
+            // Paid on a checkout this order was sent to before its total changed: money arrived, but not for this total.
+            if (in_array($session, $order['earlier'] ?? [], true) && ($event['type'] ?? '') === 'checkout.paid') {
+                return ['note', 'A payment arrived for an earlier checkout of this order, made before its total changed. It is in your SpotEx merchant wallet: check the order, and refund it from the Merchant Center if needed.'];
+            }
             return ['ignore', ''];
         }
         // A live order is paid only by live money; a test one only ever by tests.
@@ -101,8 +110,13 @@ final class SpotEx_Pay_Orders
             if (($checkout['status'] ?? '') !== 'paid') {
                 return ['ignore', ''];
             }
-            if (($checkout['currency'] ?? '') !== $order['currency'] || !self::same_amount((string) ($checkout['price'] ?? ''), (string) $order['price'])) {
-                return ['note', 'SpotEx reported a payment of ' . ($checkout['price'] ?? '?') . ' ' . ($checkout['currency'] ?? '') . ", not this order's total: check it before shipping."];
+            $price = (string) ($checkout['price'] ?? '');
+            if (($checkout['currency'] ?? '') !== $order['currency'] || preg_match('/\A\d+(\.\d+)?\z/', $price) !== 1 || !self::same_amount($price, (string) $order['price'])) {
+                return ['note', 'SpotEx reported a payment of ' . ($price ?: '?') . ' ' . ($checkout['currency'] ?? '') . ", not this order's total: check it before shipping."];
+            }
+            // Sent to pay one total; the order now asks another (changed by hand, or by another plugin).
+            if (($order['total'] ?? $order['price']) !== $order['price']) {
+                return ['note', "Paid {$order['price']} {$order['currency']} with SpotEx Pay, but the order's total has changed since: check it before shipping."];
             }
             $id = (string) ($checkout['id'] ?? '');
             if (!$live) {

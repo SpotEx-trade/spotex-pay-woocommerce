@@ -27,14 +27,18 @@ final class SpotEx_Pay_Client
     private $key;
     /** @var callable */
     private $transport;
+    /** @var int */
+    private $timeout;
 
     /**
-     * @param callable|null $transport For tests: function (string $method, string $url, array $headers, ?string $body): array [int $status, string $body]
+     * @param callable|null $transport For tests: function (string $method, string $url, array $headers, ?string $body, int $timeout): array [int $status, string $body]
+     * @param int $timeout Seconds: short where a buyer is waiting on a page.
      */
-    public function __construct(string $key, ?callable $transport = null)
+    public function __construct(string $key, ?callable $transport = null, int $timeout = 30)
     {
         $this->key = $key;
         $this->transport = $transport ?? [self::class, 'wp_transport'];
+        $this->timeout = $timeout;
     }
 
     public function is_test_mode(): bool
@@ -77,7 +81,7 @@ final class SpotEx_Pay_Client
             $headers['Idempotency-Key'] = $idempotency_key;
         }
         $base = function_exists('apply_filters') ? (string) apply_filters('spotex_pay_api_base', self::BASE_URL) : self::BASE_URL;
-        [$status, $raw] = call_user_func($this->transport, $method, rtrim($base, '/') . $path, $headers, $json);
+        [$status, $raw] = call_user_func($this->transport, $method, rtrim($base, '/') . $path, $headers, $json, $this->timeout);
         $data = json_decode((string) $raw, true);
         if ($status < 200 || $status >= 300) {
             $error = is_array($data) && isset($data['error']) && is_array($data['error']) ? $data['error'] : [];
@@ -90,9 +94,9 @@ final class SpotEx_Pay_Client
     }
 
     /** @internal WordPress's HTTP API. */
-    public static function wp_transport(string $method, string $url, array $headers, ?string $body): array
+    public static function wp_transport(string $method, string $url, array $headers, ?string $body, int $timeout = 30): array
     {
-        $args = ['method' => $method, 'headers' => $headers, 'timeout' => 30];
+        $args = ['method' => $method, 'headers' => $headers, 'timeout' => $timeout];
         if ($body !== null) {
             $args['body'] = $body;
         }

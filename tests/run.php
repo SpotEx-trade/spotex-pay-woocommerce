@@ -104,7 +104,7 @@ check('order numbers, currencies and one session per order and total', function 
     same(SpotEx_Pay_Orders::same_amount('25.01', '25.1'), false);
 });
 
-$order = ['session_id' => 'cs1', 'price' => '25.00', 'currency' => 'EUR', 'test' => false];
+$order = ['session_id' => 'cs1', 'earlier' => ['cs0'], 'price' => '25.00', 'total' => '25.00', 'currency' => 'EUR', 'test' => false];
 $paid = function (array $checkout = [], bool $live = true): array {
     return ['type' => 'checkout.paid', 'livemode' => $live, 'data' => ['checkout' => $checkout + [
         'id' => 'cm1', 'session_id' => 'cs1', 'status' => 'paid', 'price' => '25.00', 'currency' => 'EUR', 'received' => '12.5', 'coin' => 'PPC', 'duplicate' => false,
@@ -127,6 +127,10 @@ check('nothing else completes an order', function () use ($order, $paid) {
     same(SpotEx_Pay_Orders::event_action(['type' => 'checkout.partial', 'livemode' => true, 'data' => ['checkout' => ['session_id' => 'cs1']]], $order)[0], 'note');
     same(SpotEx_Pay_Orders::event_action(['type' => 'payout.transfer.completed', 'livemode' => true, 'data' => []], $order)[0], 'ignore');
     same(SpotEx_Pay_Orders::event_action(['type' => 'checkout.paid', 'data' => ['checkout' => ['session_id' => 'cs1', 'status' => 'paid']]], $order)[0], 'ignore', 'no livemode: not live');
+    same(SpotEx_Pay_Orders::event_action($paid(['price' => '']), ['price' => ''] + $order)[0], 'ignore', 'empty prices never match');
+    same(SpotEx_Pay_Orders::event_action($paid(['session_id' => '']), ['session_id' => ''] + $order)[0], 'ignore', 'nor empty sessions');
+    same(SpotEx_Pay_Orders::event_action($paid(), ['total' => '30.00'] + $order)[0], 'note', 'the total changed since it was sent');
+    same(SpotEx_Pay_Orders::event_action($paid(['session_id' => 'cs0']), $order)[0], 'note', 'paid on an earlier checkout of the order');
 });
 
 check('a test key: test payments only ever put an order on hold, never pay it', function () use ($order, $paid) {
@@ -137,8 +141,8 @@ check('a test key: test payments only ever put an order on hold, never pay it', 
 
 check('the API client: bearer key, JSON body, idempotency key, errors', function () {
     $seen = [];
-    $client = new SpotEx_Pay_Client('sk_live_abc', function ($method, $url, $headers, $body) use (&$seen) {
-        $seen[] = [$method, $url, $headers, $body];
+    $client = new SpotEx_Pay_Client('sk_live_abc', function ($method, $url, $headers, $body, $timeout) use (&$seen) {
+        $seen[] = [$method, $url, $headers, $body, $timeout];
         return strpos($url, '/nope') !== false ? [403, '{"error":{"code":"test_mode","message":"No."}}'] : [201, '{"id":"cs1","url":"https://spotex.trade/m/cs1"}'];
     });
     $s = $client->create_session(['price' => '25.00', 'currency' => 'EUR', 'item' => 'Order 1043'], 'wc-42-abc');
@@ -149,6 +153,7 @@ check('the API client: bearer key, JSON body, idempotency key, errors', function
     same($seen[0][2]['Idempotency-Key'], 'wc-42-abc');
     same(json_decode($seen[0][3], true), ['price' => '25.00', 'currency' => 'EUR', 'item' => 'Order 1043']);
     same($client->is_test_mode(), false);
+    same($seen[0][4], 30, 'the default timeout');
     $client->retrieve_session('cs/1');
     same($seen[1][1], 'https://spotex.trade/api/merchant/v1/checkout-sessions/cs%2F1');
     throws(function () use ($client) {
